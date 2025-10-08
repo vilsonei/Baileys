@@ -6,7 +6,7 @@
 > [!CAUTION]
 > NOTICE OF BREAKING CHANGE.
 > 
-> As of 6.8.0, multiple breaking changes were introduced into the library.
+> As of 7.0.0, multiple breaking changes were introduced into the library.
 > 
 > Please check out https://whiskey.so/migrate-latest for more information.
 
@@ -332,6 +332,9 @@ sock.ev.on('messages.upsert', ({ messages }) => {
 
 > [!NOTE]
 > This example includes basic auth storage too
+
+> [!NOTE]
+> For reliable serialization of the authentication state, especially when storing as JSON, always use the BufferJSON utility.
 
 ```ts
 import makeWASocket, { DisconnectReason, useMultiFileAuthState } from '@whiskeysockets/baileys'

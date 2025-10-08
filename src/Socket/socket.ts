@@ -12,7 +12,7 @@ import {
 	NOISE_WA_HEADER,
 	UPLOAD_TIMEOUT
 } from '../Defaults'
-import type { SocketConfig } from '../Types'
+import type { LIDMapping, SocketConfig } from '../Types'
 import { DisconnectReason } from '../Types'
 import {
 	addTransactionCapability,
@@ -28,11 +28,11 @@ import {
 	getCodeFromWSError,
 	getErrorCodeFromStreamError,
 	getNextPreKeysNode,
-	getPlatformId,
 	makeEventBuffer,
 	makeNoiseHandler,
 	promiseTimeout
 } from '../Utils'
+import { getPlatformId } from '../Utils/browser-utils'
 import {
 	assertNodeErrorFree,
 	type BinaryNode,
@@ -40,9 +40,13 @@ import {
 	encodeBinaryNode,
 	getBinaryNodeChild,
 	getBinaryNodeChildren,
+	isLidUser,
+	jidDecode,
 	jidEncode,
 	S_WHATSAPP_NET
 } from '../WABinary'
+import { BinaryInfo } from '../WAM/BinaryInfo.js'
+import { USyncQuery, USyncUser } from '../WAUSync/'
 import { WebSocketClient } from './Client'
 
 /**
@@ -67,6 +71,11 @@ export const makeSocket = (config: SocketConfig) => {
 		makeSignalRepository
 	} = config
 
+	const publicWAMBuffer = new BinaryInfo()
+
+	const uqTagId = generateMdTagPrefix()
+	const generateMessageTag = () => `${uqTagId}${epoch++}`
+
 	if (printQRInTerminal) {
 		console.warn(
 			'⚠️ The printQRInTerminal option has been deprecated. You will no longer receive QR codes in the terminal automatically. Please listen to the connection.update event yourself and handle the QR your way. You can remove this message by removing this opttion. This message will be removed in a future version.'
@@ -83,11 +92,6 @@ export const makeSocket = (config: SocketConfig) => {
 		url.searchParams.append('ED', authState.creds.routingInfo.toString('base64url'))
 	}
 
-	const ws = new WebSocketClient(url, config)
-
-	ws.connect()
-
-	const ev = makeEventBuffer(logger)
 	/** ephemeral key pair used to encrypt/decrypt communication. Unique for each connection */
 	const ephemeralKeyPair = Curve.generateKeyPair()
 	/** WA noise protocol wrapper */
@@ -98,19 +102,9 @@ export const makeSocket = (config: SocketConfig) => {
 		routingInfo: authState?.creds?.routingInfo
 	})
 
-	const { creds } = authState
-	// add transaction capability
-	const keys = addTransactionCapability(authState.keys, logger, transactionOpts)
-	const signalRepository = makeSignalRepository({ creds, keys })
+	const ws = new WebSocketClient(url, config)
 
-	let lastDateRecv: Date
-	let epoch = 1
-	let keepAliveReq: NodeJS.Timeout
-	let qrTimer: NodeJS.Timeout
-	let closed = false
-
-	const uqTagId = generateMdTagPrefix()
-	const generateMessageTag = () => `${uqTagId}${epoch++}`
+	ws.connect()
 
 	const sendPromise = promisify(ws.send)
 	/** send a raw buffer */
@@ -138,41 +132,6 @@ export const makeSocket = (config: SocketConfig) => {
 
 		const buff = encodeBinaryNode(frame)
 		return sendRawMessage(buff)
-	}
-
-	/** log & process any unexpected errors */
-	const onUnexpectedError = (err: Error | Boom, msg: string) => {
-		logger.error({ err }, `unexpected error in '${msg}'`)
-	}
-
-	/** await the next incoming message */
-	const awaitNextMessage = async <T>(sendMsg?: Uint8Array) => {
-		if (!ws.isOpen) {
-			throw new Boom('Connection Closed', {
-				statusCode: DisconnectReason.connectionClosed
-			})
-		}
-
-		let onOpen: (data: T) => void
-		let onClose: (err: Error) => void
-
-		const result = promiseTimeout<T>(connectTimeoutMs, (resolve, reject) => {
-			onOpen = resolve
-			onClose = mapWebSocketError(reject)
-			ws.on('frame', onOpen)
-			ws.on('close', onClose)
-			ws.on('error', onClose)
-		}).finally(() => {
-			ws.off('frame', onOpen)
-			ws.off('close', onClose)
-			ws.off('error', onClose)
-		})
-
-		if (sendMsg) {
-			sendRawMessage(sendMsg).catch(onClose!)
-		}
-
-		return result
 	}
 
 	/**
@@ -231,9 +190,9 @@ export const makeSocket = (config: SocketConfig) => {
 		const msgId = node.attrs.id
 
 		const result = await promiseTimeout<any>(timeoutMs, async (resolve, reject) => {
-			const result = await waitForMessage(msgId, timeoutMs).catch(reject)
+			const result = waitForMessage(msgId, timeoutMs).catch(reject)
 			sendNode(node)
-				.then(() => resolve(result))
+				.then(async () => resolve(await result))
 				.catch(reject)
 		})
 
@@ -244,12 +203,172 @@ export const makeSocket = (config: SocketConfig) => {
 		return result
 	}
 
+	const executeUSyncQuery = async (usyncQuery: USyncQuery) => {
+		if (usyncQuery.protocols.length === 0) {
+			throw new Boom('USyncQuery must have at least one protocol')
+		}
+
+		// todo: validate users, throw WARNING on no valid users
+		// variable below has only validated users
+		const validUsers = usyncQuery.users
+
+		const userNodes = validUsers.map(user => {
+			return {
+				tag: 'user',
+				attrs: {
+					jid: !user.phone ? user.id : undefined
+				},
+				content: usyncQuery.protocols.map(a => a.getUserElement(user)).filter(a => a !== null)
+			} as BinaryNode
+		})
+
+		const listNode: BinaryNode = {
+			tag: 'list',
+			attrs: {},
+			content: userNodes
+		}
+
+		const queryNode: BinaryNode = {
+			tag: 'query',
+			attrs: {},
+			content: usyncQuery.protocols.map(a => a.getQueryElement())
+		}
+		const iq = {
+			tag: 'iq',
+			attrs: {
+				to: S_WHATSAPP_NET,
+				type: 'get',
+				xmlns: 'usync'
+			},
+			content: [
+				{
+					tag: 'usync',
+					attrs: {
+						context: usyncQuery.context,
+						mode: usyncQuery.mode,
+						sid: generateMessageTag(),
+						last: 'true',
+						index: '0'
+					},
+					content: [queryNode, listNode]
+				}
+			]
+		}
+
+		const result = await query(iq)
+
+		return usyncQuery.parseUSyncQueryResult(result)
+	}
+
+	const onWhatsApp = async (...phoneNumber: string[]) => {
+		let usyncQuery = new USyncQuery()
+
+		let contactEnabled = false
+		for (const jid of phoneNumber) {
+			if (isLidUser(jid)) {
+				logger?.warn('LIDs are not supported with onWhatsApp')
+				continue
+			} else {
+				if (!contactEnabled) {
+					contactEnabled = true
+					usyncQuery = usyncQuery.withContactProtocol()
+				}
+
+				const phone = `+${jid.replace('+', '').split('@')[0]?.split(':')[0]}`
+				usyncQuery.withUser(new USyncUser().withPhone(phone))
+			}
+		}
+
+		if (usyncQuery.users.length === 0) {
+			return [] // return early without forcing an empty query
+		}
+
+		const results = await executeUSyncQuery(usyncQuery)
+
+		if (results) {
+			return results.list.filter(a => !!a.contact).map(({ contact, id }) => ({ jid: id, exists: contact as boolean }))
+		}
+	}
+
+	const pnFromLIDUSync = async (jids: string[]): Promise<LIDMapping[] | undefined> => {
+		const usyncQuery = new USyncQuery().withLIDProtocol().withContext('background')
+
+		for (const jid of jids) {
+			if (isLidUser(jid)) {
+				logger?.warn('LID user found in LID fetch call')
+				continue
+			} else {
+				usyncQuery.withUser(new USyncUser().withId(jid))
+			}
+		}
+
+		if (usyncQuery.users.length === 0) {
+			return [] // return early without forcing an empty query
+		}
+
+		const results = await executeUSyncQuery(usyncQuery)
+
+		if (results) {
+			return results.list.filter(a => !!a.lid).map(({ lid, id }) => ({ pn: id, lid: lid as string }))
+		}
+
+		return []
+	}
+
+	const ev = makeEventBuffer(logger)
+
+	const { creds } = authState
+	// add transaction capability
+	const keys = addTransactionCapability(authState.keys, logger, transactionOpts)
+	const signalRepository = makeSignalRepository({ creds, keys }, logger, pnFromLIDUSync)
+
+	let lastDateRecv: Date
+	let epoch = 1
+	let keepAliveReq: NodeJS.Timeout
+	let qrTimer: NodeJS.Timeout
+	let closed = false
+
+	/** log & process any unexpected errors */
+	const onUnexpectedError = (err: Error | Boom, msg: string) => {
+		logger.error({ err }, `unexpected error in '${msg}'`)
+	}
+
+	/** await the next incoming message */
+	const awaitNextMessage = async <T>(sendMsg?: Uint8Array) => {
+		if (!ws.isOpen) {
+			throw new Boom('Connection Closed', {
+				statusCode: DisconnectReason.connectionClosed
+			})
+		}
+
+		let onOpen: (data: T) => void
+		let onClose: (err: Error) => void
+
+		const result = promiseTimeout<T>(connectTimeoutMs, (resolve, reject) => {
+			onOpen = resolve
+			onClose = mapWebSocketError(reject)
+			ws.on('frame', onOpen)
+			ws.on('close', onClose)
+			ws.on('error', onClose)
+		}).finally(() => {
+			ws.off('frame', onOpen)
+			ws.off('close', onClose)
+			ws.off('error', onClose)
+		})
+
+		if (sendMsg) {
+			sendRawMessage(sendMsg).catch(onClose!)
+		}
+
+		return result
+	}
+
 	/** connection handshake */
 	const validateConnection = async () => {
 		let helloMsg: proto.IHandshakeMessage = {
 			clientHello: { ephemeral: ephemeralKeyPair.public }
 		}
-		helloMsg = proto.HandshakeMessage.create(helloMsg)
+		helloMsg = proto.HandshakeMessage.fromObject(helloMsg)
 
 		logger.info({ browser, helloMsg }, 'connected to WA')
 
@@ -764,9 +883,17 @@ export const makeSocket = (config: SocketConfig) => {
 					const myPN = authState.creds.me!.id
 
 					// Store our own LID-PN mapping
-					await signalRepository.storeLIDPNMapping(myLID, myPN)
+					await signalRepository.lidMapping.storeLIDPNMappings([{ lid: myLID, pn: myPN }])
 
-					// Create LID session for ourselves (whatsmeow pattern)
+					// Create device list for our own user (needed for bulk migration)
+					const { user, device } = jidDecode(myPN)!
+					await authState.keys.set({
+						'device-list': {
+							[user]: [device?.toString() || '0']
+						}
+					})
+
+					// migrate our own session
 					await signalRepository.migrateSession(myPN, myLID)
 
 					logger.info({ myPN, myLID }, 'Own LID session created successfully')
@@ -876,9 +1003,12 @@ export const makeSocket = (config: SocketConfig) => {
 		uploadPreKeys,
 		uploadPreKeysToServerIfRequired,
 		requestPairingCode,
+		wamBuffer: publicWAMBuffer,
 		/** Waits for the connection to WA to reach a state */
 		waitForConnectionUpdate: bindWaitForConnectionUpdate(ev),
-		sendWAMBuffer
+		sendWAMBuffer,
+		executeUSyncQuery,
+		onWhatsApp
 	}
 }
 
